@@ -110,4 +110,160 @@ mod tests {
         };
         assert_eq!(block_on(f), 42);
     }
+
+    /// Ready only once woken by the waker from the *latest* poll. Hangs if `block_on` keeps
+    /// waiting on the waker from the initial no-op poll.
+    #[cfg(feature = "std")]
+    struct WakeLater {
+        polls: u32,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "std")]
+    impl Future for WakeLater {
+        type Output = u32;
+
+        fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+            if self.done.load(std::sync::atomic::Ordering::SeqCst) {
+                return Poll::Ready(self.polls);
+            }
+            self.polls += 1;
+            let waker = cx.waker().clone();
+            let done = std::sync::Arc::clone(&self.done);
+            std::thread::spawn(move || {
+                std::thread::sleep(core::time::Duration::from_millis(5));
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                waker.wake();
+            });
+            Poll::Pending
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_block_on_reregisters_waker_after_noop_poll() {
+        let f = WakeLater { polls: 0, done: Default::default() };
+        // First poll uses the no-op waker, second registers the real one.
+        assert_eq!(block_on(f), 2);
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_block_on_oneshot_sent_between_polls() {
+        for _ in 0..1000 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || tx.send(7).unwrap());
+            assert_eq!(block_on(rx).unwrap(), 7);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_block_on_yield_now_inside_runtime() {
+        assert_eq!(
+            block_on(async {
+                tokio::task::yield_now().await;
+                42
+            }),
+            42
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_block_on_nested_inside_runtime() {
+        let v = block_on(async {
+            let inner = block_on(async {
+                tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+                block_on(ready(1))
+            });
+            inner + block_on(async { 41 })
+        });
+        assert_eq!(v, 42);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_block_on_nested_outside_runtime() {
+        let v = block_on(async {
+            tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+            block_on(async {
+                tokio::task::yield_now().await;
+                42
+            })
+        });
+        assert_eq!(v, 42);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_block_on_ready_inside_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async { assert_eq!(block_on(ready(42)), 42) });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_block_on_from_spawn_blocking() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let v = rt.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                block_on(async {
+                    tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+                    42
+                })
+            })
+            .await
+        });
+        assert_eq!(v.unwrap(), 42);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_block_on_concurrent_fallback_runtime() {
+        let handles: alloc::vec::Vec<_> = (0..32)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let mut sum = 0u64;
+                    for j in 0..100u64 {
+                        sum += block_on(async move {
+                            tokio::task::yield_now().await;
+                            i * j
+                        });
+                    }
+                    sum
+                })
+            })
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            assert_eq!(h.join().unwrap(), (i as u64) * 4950);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_block_on_panic_in_first_poll_propagates() {
+        let r = std::panic::catch_unwind(|| block_on(async { panic!("boom") }));
+        assert!(r.is_err());
+        // Runtime is still usable afterwards.
+        assert_eq!(block_on(ready(1)), 1);
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_block_on_drops_future_once() {
+        struct DropCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = DropCounter(std::sync::Arc::clone(&drops));
+        block_on(async move {
+            let _g = guard;
+            tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+        });
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
