@@ -77,11 +77,6 @@ impl OperationName {
         self.0.make_ascii_uppercase();
     }
 
-    /// Returns whether two raw names normalize to the same operation name, without allocating.
-    pub fn equivalent(left: &str, right: &str) -> bool {
-        left.trim().eq_ignore_ascii_case(right.trim())
-    }
-
     /// Returns the normalized name.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -266,9 +261,10 @@ impl ResourceSample {
     pub fn from_execution(gas_used: u64, state: &EvmState, simulated: Option<&Self>) -> Self {
         let mut operations = simulated.map(|sample| sample.operations.clone()).unwrap_or_default();
         operations.retain(|entry| {
+            let name = entry.opcode.trim();
             !Self::EXECUTED_STATE_OPERATIONS
                 .iter()
-                .any(|operation| OperationName::equivalent(operation, &entry.opcode))
+                .any(|operation| name.eq_ignore_ascii_case(operation))
         });
         Self::push_count(
             &mut operations,
