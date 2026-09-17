@@ -229,8 +229,10 @@ impl ResourceSample {
     pub fn from_execution(gas_used: u64, state: &EvmState, simulated: Option<&Self>) -> Self {
         let mut operations = simulated.map(|sample| sample.operations.clone()).unwrap_or_default();
         operations.retain(|entry| {
-            let name = ResourceMeteringSchedule::normalize_operation_name(&entry.opcode);
-            !Self::EXECUTED_STATE_OPERATIONS.iter().any(|operation| name == *operation)
+            let name = entry.opcode.trim();
+            !Self::EXECUTED_STATE_OPERATIONS
+                .iter()
+                .any(|operation| name.eq_ignore_ascii_case(operation))
         });
         Self::push_count(
             &mut operations,
@@ -370,9 +372,10 @@ impl ResourceMeteringSchedule {
                 .ok_or(ResourceMeteringError::ArithmeticOverflow)?;
         }
 
+        let mut operation_name = String::new();
         for entry in opcode_gas {
-            let operation_name = Self::normalize_operation_name(&entry.opcode);
-            let Some(prices) = self.operation_index.get(&operation_name) else {
+            Self::normalize_operation_name_into(&entry.opcode, &mut operation_name);
+            let Some(prices) = self.operation_index.get(operation_name.as_str()) else {
                 continue;
             };
 
@@ -720,6 +723,13 @@ impl ResourceMeteringSchedule {
     /// Normalizes an operation name for case-insensitive schedule matching.
     pub fn normalize_operation_name(name: &str) -> String {
         name.trim().to_ascii_uppercase()
+    }
+
+    /// Writes the normalized form of `name` into `buffer`, reusing its allocation.
+    pub fn normalize_operation_name_into(name: &str, buffer: &mut String) {
+        buffer.clear();
+        buffer.push_str(name.trim());
+        buffer.make_ascii_uppercase();
     }
 }
 
