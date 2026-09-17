@@ -14,7 +14,11 @@
 //! transaction cannot fit any block. Neither changes protocol gas, fees, or
 //! validity.
 
-use std::{collections::HashMap, fmt, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, fs,
+    path::Path,
+};
 
 use alloy_primitives::{Address, TxHash};
 use base_bundles::{MeterBundleResponse, OpcodeGas};
@@ -42,12 +46,40 @@ pub struct ResourceMeteringSchedule {
     /// Independently budgeted resource dimensions.
     pub dimensions: Vec<ResourceMeteringDimension>,
     #[serde(skip)]
-    operation_index: HashMap<String, Vec<(usize, u64, u64)>>,
+    operation_index: HashMap<OperationName, Vec<(usize, u64, u64)>>,
 }
 
 impl Default for ResourceMeteringSchedule {
     fn default() -> Self {
         Self::new(Vec::new())
+    }
+}
+
+/// A schedule operation name normalized for case-insensitive matching.
+///
+/// Stored trimmed and ASCII-uppercased so schedule keys and observed opcode
+/// names compare equal regardless of case or surrounding whitespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OperationName(String);
+
+impl OperationName {
+    /// Normalizes `raw` into a new operation name.
+    pub fn new(raw: &str) -> Self {
+        let mut name = Self(String::new());
+        name.assign(raw);
+        name
+    }
+
+    /// Replaces the contents with the normalized form of `raw`, reusing the allocation.
+    pub fn assign(&mut self, raw: &str) {
+        self.0.clear();
+        self.0.push_str(raw.trim());
+        self.0.make_ascii_uppercase();
+    }
+
+    /// Returns the normalized name.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -229,8 +261,10 @@ impl ResourceSample {
     pub fn from_execution(gas_used: u64, state: &EvmState, simulated: Option<&Self>) -> Self {
         let mut operations = simulated.map(|sample| sample.operations.clone()).unwrap_or_default();
         operations.retain(|entry| {
-            let name = ResourceMeteringSchedule::normalize_operation_name(&entry.opcode);
-            !Self::EXECUTED_STATE_OPERATIONS.iter().any(|operation| name == *operation)
+            let name = entry.opcode.trim();
+            !Self::EXECUTED_STATE_OPERATIONS
+                .iter()
+                .any(|operation| name.eq_ignore_ascii_case(operation))
         });
         Self::push_count(
             &mut operations,
@@ -332,14 +366,15 @@ impl ResourceMeteringSchedule {
     pub fn compile(mut self) -> Result<Self, ResourceMeteringError> {
         self.validate()?;
 
-        let mut operation_index: HashMap<String, Vec<(usize, u64, u64)>> = HashMap::new();
+        let mut operation_index: HashMap<OperationName, Vec<(usize, u64, u64)>> = HashMap::new();
         for (dimension_index, dimension) in self.dimensions.iter_mut().enumerate() {
             dimension.name = dimension.name.trim().to_string();
             for operation in &dimension.operations {
-                operation_index
-                    .entry(Self::normalize_operation_name(&operation.name))
-                    .or_default()
-                    .push((dimension_index, operation.gas_used_weight, operation.count_cost));
+                operation_index.entry(OperationName::new(&operation.name)).or_default().push((
+                    dimension_index,
+                    operation.gas_used_weight,
+                    operation.count_cost,
+                ));
             }
         }
         self.operation_index = operation_index;
@@ -353,7 +388,7 @@ impl ResourceMeteringSchedule {
 
     /// Operation names priced by this schedule, including post-state effects.
     pub fn priced_operation_names(&self) -> impl Iterator<Item = &str> {
-        self.operation_index.keys().map(String::as_str)
+        self.operation_index.keys().map(OperationName::as_str)
     }
 
     /// Calculates all dimension costs for one metered transaction.
@@ -370,8 +405,9 @@ impl ResourceMeteringSchedule {
                 .ok_or(ResourceMeteringError::ArithmeticOverflow)?;
         }
 
+        let mut operation_name = OperationName::new("");
         for entry in opcode_gas {
-            let operation_name = Self::normalize_operation_name(&entry.opcode);
+            operation_name.assign(&entry.opcode);
             let Some(prices) = self.operation_index.get(&operation_name) else {
                 continue;
             };
@@ -672,7 +708,7 @@ impl ResourceMeteringSchedule {
                 });
             }
 
-            let mut operation_names = HashMap::with_capacity(dimension.operations.len());
+            let mut operation_names = HashSet::with_capacity(dimension.operations.len());
             let has_base_price = dimension.base_gas_weight > 0;
             let mut has_operation_price = false;
             for operation in &dimension.operations {
@@ -683,8 +719,7 @@ impl ResourceMeteringSchedule {
                         operation: operation.name.clone(),
                     });
                 }
-                let operation_name = Self::normalize_operation_name(&operation.name);
-                if operation_names.insert(operation_name, ()).is_some() {
+                if !operation_names.insert(OperationName::new(&operation.name)) {
                     return Err(ResourceMeteringError::DuplicateOperation {
                         dimension: dimension.name.clone(),
                         operation: operation.name.clone(),
@@ -715,11 +750,6 @@ impl ResourceMeteringSchedule {
             });
         }
         Ok(())
-    }
-
-    /// Normalizes an operation name for case-insensitive schedule matching.
-    pub fn normalize_operation_name(name: &str) -> String {
-        name.trim().to_ascii_uppercase()
     }
 }
 

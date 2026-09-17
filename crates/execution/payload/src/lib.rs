@@ -22,7 +22,7 @@ mod metering;
 pub use metering::{MeteringProvider, NoopMeteringProvider, SharedMeteringProvider};
 mod resource_metering;
 pub use resource_metering::{
-    ResourceMeteringDimension, ResourceMeteringError, ResourceMeteringOperation,
+    OperationName, ResourceMeteringDimension, ResourceMeteringError, ResourceMeteringOperation,
     ResourceMeteringSchedule, ResourceMeteringUsage, ResourceSample, ResourceThrottlingCheckError,
     ResourceThrottlingDecision, ResourceThrottlingLimitExceeded, ResourceThrottlingLimitScope,
 };
