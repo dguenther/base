@@ -257,9 +257,93 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use alloy_primitives::b256;
+    use base_proof_primitives::{ProofBundle, ProofRequest};
 
     use super::*;
+
+    /// Witness recorded from the `anvil-nitro-local` devnet (chain 84538453) for L2 blocks
+    /// 100..=110: zstd-compressed bincode of `(request_json, preimages)`, the same data the
+    /// host hands to the enclave.
+    const DEVNET_PROOF_BUNDLE: &[u8] =
+        include_bytes!("../testdata/devnet_proof_bundle_100_110.bin.zst");
+
+    type EncodedBundle = (Vec<u8>, Vec<(PreimageKey, Vec<u8>)>);
+
+    fn devnet_proof_bundle() -> ProofBundle {
+        let raw = zstd::decode_all(DEVNET_PROOF_BUNDLE).expect("decompress fixture");
+        let ((request_json, preimages), _): (EncodedBundle, usize) =
+            bincode::serde::decode_from_slice(&raw, bincode::config::standard())
+                .expect("decode fixture");
+        let request: ProofRequest = serde_json::from_slice(&request_json).expect("decode request");
+        ProofBundle { request, preimages }
+    }
+
+    /// Runs `prove` the way the nitro host binary does: as a task on a multi-thread Tokio
+    /// runtime with enlarged worker stacks (the debug-build proof driver is deeply recursive).
+    fn prove_on_worker_runtime(
+        server: &Arc<Server>,
+        preimages: Vec<(PreimageKey, Vec<u8>)>,
+    ) -> Result<ProofResult> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(64 * 1024 * 1024)
+            .build()
+            .expect("runtime");
+        let server = Arc::clone(server);
+        runtime.block_on(runtime.spawn(async move { server.prove(preimages).await })).expect("join")
+    }
+
+    #[test]
+    fn prove_devnet_bundle_end_to_end() {
+        let bundle = devnet_proof_bundle();
+        let request = bundle.request;
+        let server = Arc::new(Server::new_local().expect("failed to create server"));
+
+        let result = prove_on_worker_runtime(&server, bundle.preimages).expect("proof pipeline");
+
+        let ProofResult::Tee { aggregate_proposal, proposals, tee_signer } = result else {
+            panic!("expected TEE proof result");
+        };
+        assert_eq!(tee_signer, server.signer_address());
+
+        let expected_blocks: Vec<u64> =
+            (request.claimed_l2_block_number - 9..=request.claimed_l2_block_number).collect();
+        let blocks: Vec<u64> = proposals.iter().map(|p| p.l2_block_number).collect();
+        assert_eq!(blocks, expected_blocks);
+        assert_eq!(proposals[0].prev_output_root, request.agreed_l2_output_root);
+        for pair in proposals.windows(2) {
+            assert_eq!(pair[1].prev_output_root, pair[0].output_root);
+        }
+
+        assert_eq!(aggregate_proposal.output_root, request.claimed_l2_output_root);
+        assert_eq!(aggregate_proposal.prev_output_root, request.agreed_l2_output_root);
+        assert_eq!(aggregate_proposal.l2_block_number, request.claimed_l2_block_number);
+        assert_eq!(aggregate_proposal.l1_origin_hash, request.l1_head);
+        assert_eq!(aggregate_proposal.config_hash, config_hash_for_chain(84538453).unwrap());
+        assert_eq!(aggregate_proposal.signature.len(), 65);
+    }
+
+    #[test]
+    fn prove_devnet_bundle_rejects_wrong_claim() {
+        let mut bundle = devnet_proof_bundle();
+        // The claimed output root lives in a `Local` preimage; corrupt it so derivation
+        // succeeds but the epilogue's output-root check must fail.
+        let claimed_key = PreimageKey::new_local(base_proof::L2_CLAIM_KEY.to());
+        let entry = bundle
+            .preimages
+            .iter_mut()
+            .find(|(k, _)| *k == claimed_key)
+            .expect("claim preimage present");
+        entry.1[0] ^= 0xff;
+        let server = Arc::new(Server::new_local().expect("failed to create server"));
+
+        let err = prove_on_worker_runtime(&server, bundle.preimages)
+            .expect_err("tampered claim must fail");
+        assert!(matches!(err, NitroError::ProofPipeline(_)), "{err:?}");
+    }
 
     #[test]
     fn test_server_new_local_mode() {

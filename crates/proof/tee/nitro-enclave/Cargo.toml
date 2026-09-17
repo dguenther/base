@@ -56,8 +56,9 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 hex.workspace = true
+zstd.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [package.metadata.cargo-udeps.ignore]
 normal = ["aws-nitro-enclaves-nsm-api"]

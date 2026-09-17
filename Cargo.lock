@@ -5512,6 +5512,7 @@ dependencies = [
  "tokio",
  "tokio-vsock",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
