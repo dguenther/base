@@ -2,17 +2,43 @@
 //! code in an embedded environment.
 
 use core::future::Future;
+#[cfg(feature = "std")]
+use core::{
+    pin::pin,
+    task::{Context, Poll, Waker},
+};
+#[cfg(feature = "std")]
+extern crate std;
+#[cfg(feature = "std")]
+use std::sync::LazyLock;
+
+/// Runtime used when `block_on` is called outside of a Tokio runtime.
+#[cfg(feature = "std")]
+static FALLBACK_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build fallback runtime")
+});
 
 /// This function blocks on a future in place until it is ready.
+///
+/// When called from within a Tokio runtime, the future is first polled once with a no-op waker.
+/// Futures that complete immediately (e.g. in-memory oracle lookups) return without handing the
+/// worker off via `block_in_place`; only futures that are still pending pay that cost.
 #[cfg(feature = "std")]
 pub fn block_on<T>(f: impl Future<Output = T>) -> T {
-    // When running with Tokio, use the appropriate blocking mechanism
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| runtime.block_on(f))
-    } else {
-        // Fallback to tokio's block_on if we're not in a runtime
-        tokio::runtime::Runtime::new().unwrap().block_on(f)
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Fallback to a shared runtime if we're not in one
+        return FALLBACK_RUNTIME.block_on(f);
+    };
+
+    let mut f = pin!(f);
+    if let Poll::Ready(v) = f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        return v;
     }
+
+    tokio::task::block_in_place(|| runtime.block_on(f))
 }
 
 /// This function busy waits on a future until it is ready. It uses a no-op waker to poll the future
@@ -62,6 +88,26 @@ mod tests {
     #[test]
     fn test_block_on_ready() {
         let f = ready(42);
+        assert_eq!(block_on(f), 42);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_block_on_pending_outside_runtime() {
+        let f = async {
+            tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+            42
+        };
+        assert_eq!(block_on(f), 42);
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_block_on_pending_inside_runtime() {
+        let f = async {
+            tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+            42
+        };
         assert_eq!(block_on(f), 42);
     }
 }
